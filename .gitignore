@@ -49,3 +49,6 @@ htmlcov/
 
 # Third party files
 third_party/
+
+# Data
+data_processed/
