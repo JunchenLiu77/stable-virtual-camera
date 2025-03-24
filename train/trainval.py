@@ -5,14 +5,13 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import math
 import tyro
+import imageio.v3 as iio
+from peft import LoraConfig, get_peft_model
 from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
-from train.runner import Launcher, LauncherConfig, nested_to_device
-import imageio.v3 as iio
 
 from seva.model import SGMWrapper
 from seva.modules.autoencoder import AutoEncoder
@@ -24,6 +23,7 @@ from seva.sampling import (
 )
 from seva.utils import load_model
 from seva.geometry import get_plucker_coordinates
+from train.runner import Launcher, LauncherConfig, nested_to_device
 from train.dataset import TrainDataset
 from train.runner import set_random_seed
 
@@ -36,7 +36,7 @@ class SEVALauncherConfig(LauncherConfig):
     ckpt_every: int = 1000
     print_every: int = 100
     visual_every: int = 100
-    lr: float = 4e-4
+    lr: float = 1e-4
     warmup_steps: int = 2500
     disable_ae_decoder: bool = False
 
@@ -64,7 +64,6 @@ class SEVALauncher(Launcher):
     def process(
         self,
         data: Dict[str, Any],
-        training: bool = True,
         p_drop: float = 0.1,
         scene_scale: float = 2.0,
     ) -> Tuple[torch.Tensor, dict, dict]:
@@ -78,9 +77,6 @@ class SEVALauncher(Launcher):
         4. pack data for conditional generation.
         5. pack data for sampling/visualization.
         """
-        if not training:
-            # TODO: what to do for inference?
-            raise NotImplementedError("Not implemented for inference.")
         assert "latent" in data and "clip" in data, "latent and clip must be provided"
         B, V, H, W, C = data["image"].shape
         assert H == W == self.config.patch_size, "patch size must be equal to 256"
@@ -93,12 +89,15 @@ class SEVALauncher(Launcher):
 
         # 1. determine the input_mask
         # TODO: input/target participation logic @hangg.
-        num_inputs = 1
-        input_masks_ = torch.tensor(
-            [1] * num_inputs + [0] * (V - num_inputs),
-            device=self.device,
-            dtype=torch.bool,
-        )  # [V]
+        num_inputs = 5
+        input_masks_ = torch.zeros(V, device=self.device, dtype=torch.bool)
+        rand_idx = torch.randperm(V)[:num_inputs]
+        input_masks_[rand_idx] = True
+        # input_masks_ = torch.tensor(
+        #     [1] * num_inputs + [0] * (V - num_inputs),
+        #     device=self.device,
+        #     dtype=torch.bool,
+        # )  # [V]
         input_masks = input_masks_[None].repeat(B, 1)  # [B, V]
 
         # 2. normalize camera intrinsics.
@@ -141,21 +140,19 @@ class SEVALauncher(Launcher):
         pluckers = torch.stack(pluckers, dim=0)  # [B, V, 6, H//8, W//8]
 
         if np.random.rand() > p_drop:
-            input_clips = torch.zeros_like(clips)  # [B, V, 1024]
-            input_clips[input_masks] = clips[input_masks]
-            crossattn = repeat(
-                input_clips.mean(dim=1), "b d -> b v 1 d", v=V
-            )  # [B, V, 1, 1024]
+            input_clips = clips[input_masks].reshape(B, -1, 1, 1024)
+            avg_input_clips = input_clips.mean(dim=1, keepdim=True)  # [B, 1, 1, 1024]
+            crossattn = avg_input_clips.repeat(1, V, 1, 1)
 
-            latents_and_masks = F.pad(latents, (0, 0, 0, 0, 0, 1), value=1.0)
+            latents_and_masks = F.pad(
+                latents, (0, 0, 0, 0, 0, 1), value=1.0
+            )  # [B, V, 5, H//8, W//8]
             replace = torch.zeros_like(latents_and_masks)
-            replace[input_masks] = latents_and_masks[
-                input_masks
-            ]  # [B, V, 5, H//8, W//8]
+            replace[input_masks] = latents_and_masks[input_masks]
 
             concat = torch.cat(
                 [
-                    repeat(input_masks, "b t -> b t 1 h w", h=H // 8, w=W // 8),
+                    repeat(input_masks, "b v -> b v 1 h w", h=H // 8, w=W // 8),
                     pluckers,
                 ],
                 dim=2,
@@ -170,8 +167,7 @@ class SEVALauncher(Launcher):
             "concat": concat,  # [B, V, 7, H//8, W//8]
             "dense_vector": pluckers,  # [B, V, 6, H//8, W//8]
         }
-        if not training:
-            cond["replace"] = replace  # [B, V, 5, H//8, W//8]
+        # cond["replace"] = replace  # [B, V, 5, H//8, W//8]
 
         # 5. pack first batch data for sampling/visualization.
         value_dict = {}
@@ -194,7 +190,7 @@ class SEVALauncher(Launcher):
         cond: dict,
         model: SGMWrapper,
         denoiser: DiscreteDenoiser,
-        w: torch.Tensor | float = 1.0,
+        input_masks: torch.Tensor,  # [B, V]
     ):
         """
         hangg's implementation of diffusion loss.
@@ -214,13 +210,9 @@ class SEVALauncher(Launcher):
             {k: v.flatten(0, 1) for k, v in cond.items()},
             num_frames=V,
         )
-        if isinstance(w, torch.Tensor):
-            w = w.flatten()
-        w = repeat(w * sigma**-2.0, "b -> b 1 1 1")
-        loss = (w * F.mse_loss(denoised, latents, reduction="none")).mean()
-
-        del noised, sigma_bchw
-        torch.cuda.empty_cache()
+        w = repeat(sigma**-2.0, "b -> b 1 1 1")
+        mse = F.mse_loss(denoised, latents, reduction="none")
+        loss = (w * mse)[~input_masks].mean()
         return loss
 
     @torch.inference_mode()
@@ -229,6 +221,8 @@ class SEVALauncher(Launcher):
         Adapted from eval.py, use pre-computed latent and clip instead.
         """
         model = state["model"].to(self.device)
+        if self.world_size > 1:
+            model = model.module
         ae = state["ae"].to(self.device)
         denoiser = state["denoiser"]
         sampler = state["sampler"]
@@ -245,7 +239,7 @@ class SEVALauncher(Launcher):
         num_samples = [1, self.version_dict["T"]]
         with torch.autocast("cuda"):
             latents = F.pad(latents[input_masks], (0, 0, 0, 0, 0, 1), value=1.0)
-            c_crossattn = repeat(clips[input_masks].mean(0), "d -> n 1 d", n=T)
+            c_crossattn = repeat(clips[input_masks].mean(0), "d -> v 1 d", v=T)
 
             uc_crossattn = torch.zeros_like(c_crossattn)
             c_replace = latents.new_zeros(T, *latents.shape[1:])
@@ -309,7 +303,7 @@ class SEVALauncher(Launcher):
             samples = ae.decode(samples_z, chunk_size=1)
 
         state["ae"] = state["ae"].to("cpu")
-        del latents, clips, input_masks, pluckers, samples_z
+        del latents
         torch.cuda.empty_cache()
         return samples
 
@@ -364,6 +358,24 @@ class SEVALauncher(Launcher):
             verbose=True,
             device=self.device,
         )
+
+        # ------------ Apply LoRA ------------ #
+        # for n, p in model.named_parameters():
+        #     if "transformer_blocks" in n:
+        #         print(f"{n}: {p.shape}")
+        # exit()
+
+        peft_config = LoraConfig(
+            target_modules=r"^.*\.attn[12]\.(to_q|to_k|to_v|to_out\.0)$",
+            r=16,
+            lora_alpha=32,  # alpha=2*r
+            lora_dropout=0.1,
+            bias="lora_only",
+            # modules_to_save=["norm"], # seems adding this will harm the quality
+            init_lora_weights=True,
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
 
         # Apply torch.compile for performance optimization if enabled
         if self.config.use_torch_compile:
@@ -464,9 +476,8 @@ class SEVALauncher(Launcher):
         with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
             # value_dict is the first batch data for sampling/visualization
             latents, cond, value_dict = self.process(data)
-            loss = self.diffusion_loss(latents, cond, model, denoiser)
-            del latents, cond
-            torch.cuda.empty_cache()
+            input_masks = value_dict["cond_frames_mask"]
+            loss = self.diffusion_loss(latents, cond, model, denoiser, input_masks)
 
         # save visual (first batch)
         if (
@@ -486,13 +497,10 @@ class SEVALauncher(Launcher):
             iio.imwrite(
                 (os.path.join(self.visual_dir, "training.mp4")),
                 samples_,
-                fps=5,
+                fps=self.config.video_save_fps,
                 macro_block_size=1,
                 ffmpeg_log_level="error",
             )
-
-        del value_dict
-        torch.cuda.empty_cache()
 
         # calculate metrics (first batch)
         if (
@@ -507,9 +515,11 @@ class SEVALauncher(Launcher):
                     f"LR: {state['scheduler'].get_last_lr()[0]:.3e}"
                 )
             else:
-                psnr = state["psnr_fn"](samples, gt_imgs)
-                ssim = state["ssim_fn"](samples, gt_imgs)
-                lpips = state["lpips_fn"](samples, gt_imgs)
+                pred_tars = samples[~input_masks]
+                gt_tars = gt_imgs[~input_masks]
+                psnr = state["psnr_fn"](pred_tars, gt_tars)
+                ssim = state["ssim_fn"](pred_tars, gt_tars)
+                lpips = state["lpips_fn"](pred_tars, gt_tars)
                 self.logging_on_master(
                     f"Step: {step}, Loss: {loss:.3f}, PSNR: {psnr:.3f}, "
                     f"SSIM: {ssim:.3f}, LPIPS: {lpips:.3f}, "
